@@ -28,7 +28,7 @@ The scraped data is then organized and saved into a CSV file named `products.csv
 
 1.  **Clone the repository:**
     ```bash
-    git clone [https://github.com/your-username/your-repo-name.git](https://github.com/your-username/your-repo-name.git)
+    git clone [https://github.com/mohaiminur/lazuli_scrapper.git](https://github.com/mohaiminur/lazuli_scrapper.git)
     cd your-repo-name
     ```
 
