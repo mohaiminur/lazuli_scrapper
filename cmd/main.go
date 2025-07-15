@@ -7,5 +7,5 @@ import (
 
 func main() {
 	fmt.Println("Starting Lazuli Adidas Scraper...")
-	scraper.Start()
+	scrapper.Start()
 }

@@ -1,156 +1,225 @@
-package scraper
+package scrapper
 
 import (
+	"context"
 	"encoding/csv"
 	"fmt"
 	"log"
 	"os"
 	"strings"
-	"time" // Import the time package
+	"sync"
+	"time"
 
-	"github.com/gocolly/colly/v2"
+	"github.com/chromedp/chromedp"
 )
 
-// Product defines the structure to hold scraped product information.
+// Product struct designed to hold all the data points required by the PDF.
 type Product struct {
-	URL            string
-	Breadcrumb     string
-	ImageURL       string
-	Category       string
-	ProductName    string
-	Price          string
-	AvailableSizes string
-	SizeDetails    string
-	Description    string
-	Keywords       string
+	URL                     string
+	Name                    string
+	ProductID               string
+	Price                   string
+	ImageURL                string
+	Breadcrumb              string
+	DescriptionGeneral      string
+	DescriptionTitle        string
+	DescriptionItemized     string
+	AvailableSizes          string
+	SenseOfSize             string
+	Keywords                string
+	SizeChartJSON           string
+	ReviewsJSON             string
+	OverallRating           string
+	NumberOfReviews         string
+	RecommendedRate         string
+	CoordinatedProductsJSON string
 }
 
-// Start initiates the scraping process.
+const (
+	startURL      = "https://shop.adidas.jp/men/"
+	numWorkers    = 4
+	productTarget = 250
+)
+
+// Start is the main entry point for the scraping process.
 func Start() {
-	c := colly.NewCollector(
-		colly.AllowedDomains("shop.adidas.jp", "www.adidas.jp"),
-		colly.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
+	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.Flag("headless", false),
+		chromedp.Flag("disable-blink-features", "AutomationControlled"),
+		chromedp.UserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"),
+	)
+	allocCtx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
+	defer cancel()
+
+	ctx, cancel := chromedp.NewContext(allocCtx)
+	defer cancel()
+
+	log.Println("STEP 1: Discovering product links...")
+	productLinks, err := discoverProductLinks(ctx, startURL)
+	if err != nil {
+		log.Fatalf("❌ Failed to discover product links: %v", err)
+	}
+	log.Printf("STEP 1 COMPLETE: ✅ Found %d product links. Will scrape up to %d products.", len(productLinks), productTarget)
+
+	if len(productLinks) == 0 {
+		log.Fatalf("Could not find any product links to scrape. The website structure may have changed.")
+	}
+
+	log.Printf("STEP 2: Starting %d concurrent workers...", numWorkers)
+	jobs := make(chan string, len(productLinks))
+	results := make(chan Product, len(productLinks))
+	var wg sync.WaitGroup
+
+	for i := 1; i <= numWorkers; i++ {
+		wg.Add(1)
+		go worker(i, ctx, &wg, jobs, results)
+	}
+
+	for i, link := range productLinks {
+		if i >= productTarget {
+			break
+		}
+		jobs <- link
+	}
+	close(jobs)
+
+	wg.Wait()
+	close(results)
+	log.Println("STEP 2 COMPLETE: All workers have finished.")
+
+	var finalProducts []Product
+	for product := range results {
+		finalProducts = append(finalProducts, product)
+	}
+
+	log.Printf("STEP 3: Writing %d products to CSV...", len(finalProducts))
+	writeCSV(finalProducts)
+}
+
+func worker(id int, ctx context.Context, wg *sync.WaitGroup, jobs <-chan string, results chan<- Product) {
+	defer wg.Done()
+	taskCtx, cancel := chromedp.NewContext(ctx)
+	defer cancel()
+
+	for url := range jobs {
+		log.Printf("[Worker %d] Scraping %s", id, url)
+		product, err := scrapeProductPage(taskCtx, url)
+		if err != nil {
+			log.Printf("[Worker %d] ❌ Error scraping %s: %v", id, url, err)
+			continue
+		}
+		log.Printf("[Worker %d] ✅ Success for %s. Scraped product: '%s'", id, url, product.Name)
+		results <- product
+	}
+}
+
+// discoverProductLinks finds all product detail page URLs from the main category page.
+func discoverProductLinks(ctx context.Context, url string) ([]string, error) {
+	var links []string
+	scrolls := 5
+
+	taskCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	log.Println("-> Navigating to category page and scrolling to load all products...")
+	err := chromedp.Run(taskCtx,
+		chromedp.Navigate(url),
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			for i := 0; i < scrolls; i++ {
+				log.Printf("--> Scrolling... (%d/%d)", i+1, scrolls)
+				err := chromedp.Evaluate(`window.scrollTo(0, document.documentElement.scrollHeight);`, nil).Do(ctx)
+				if err != nil {
+					return err
+				}
+				time.Sleep(2 * time.Second)
+			}
+			return nil
+		}),
+		chromedp.Evaluate(`Array.from(document.querySelectorAll('a.c-product-card__link')).map(a => a.href)`, &links),
 	)
 
-	// Add a rate limit with a delay between requests
-	c.Limit(&colly.LimitRule{
-		DomainGlob:  "*",             // Apply this rule to all domains allowed by the collector
-		Delay:       2 * time.Second, // Wait 2 seconds between requests
-		RandomDelay: 1 * time.Second, // Add a random delay of up to 1 second for more natural behavior
-	})
-
-	// Define a map of default headers to apply to all requests
-	defaultHeaders := map[string]string{
-		"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-		"Accept-Language":           "en-US,en;q=0.9,ja;q=0.8",
-		"Connection":                "keep-alive",
-		"Cache-Control":             "max-age=0",
-		"Upgrade-Insecure-Requests": "1",
-		"Referer":                   "https://www.google.com/", // Simulate a Google search referrer
+	if err != nil {
+		return nil, err
 	}
 
-	c.OnRequest(func(r *colly.Request) {
-		// Apply default headers to every request made by the main collector
-		for key, value := range defaultHeaders {
-			r.Headers.Set(key, value)
+	uniqueLinks := make(map[string]bool)
+	var result []string
+	for _, link := range links {
+		if !uniqueLinks[link] {
+			uniqueLinks[link] = true
+			result = append(result, link)
 		}
-		fmt.Printf("Visiting (main collector): %s\n", r.URL.String())
-	})
+	}
+	return result, nil
+}
 
-	c.OnError(func(r *colly.Response, err error) {
-		log.Printf("Error (main collector) visiting %s: %v (Status: %d)\n", r.Request.URL.String(), err, r.StatusCode)
-	})
+// scrapeProductPage extracts all required information from a single product page.
+func scrapeProductPage(ctx context.Context, url string) (Product, error) {
+	var p Product
+	var sizeChartRaw, reviewsRaw, coordinatedRaw string
 
-	c.OnResponse(func(r *colly.Response) {
-		fmt.Printf("Received response (main collector) for: %s (Status: %d)\n", r.Request.URL.String(), r.StatusCode)
-	})
-
-	var products []Product
-
-	productCollector := c.Clone()
-
-	// It's crucial to also apply the delay to the cloned collector,
-	// as it will be making its own requests to product pages.
-	productCollector.Limit(&colly.LimitRule{
-		DomainGlob:  "*",             // Apply this rule to all domains allowed by the collector
-		Delay:       2 * time.Second, // Wait 2 seconds between requests
-		RandomDelay: 1 * time.Second, // Add a random delay of up to 1 second
-	})
-
-	productCollector.OnRequest(func(r *colly.Request) {
-		// Apply default headers to every request made by the product collector
-		for key, value := range defaultHeaders {
-			r.Headers.Set(key, value)
-		}
-		fmt.Printf("Visiting (product collector): %s\n", r.URL.String())
-	})
-
-	productCollector.OnError(func(r *colly.Response, err error) {
-		log.Printf("Error (product collector) visiting %s: %v (Status: %d)\n", r.Request.URL.String(), err, r.StatusCode)
-	})
-
-	productCollector.OnResponse(func(r *colly.Response) {
-		fmt.Printf("Received response (product collector) for: %s (Status: %d)\n", r.Request.URL.String(), r.StatusCode)
-	})
-
-	c.OnHTML(".item-box", func(e *colly.HTMLElement) {
-		link := e.ChildAttr("a", "href")
-		if strings.Contains(link, "/products/") {
-			fullURL := e.Request.AbsoluteURL(link)
-			fmt.Printf("    [Main Collector] Found product link: %s\n", fullURL)
-			productCollector.Visit(fullURL)
-		} else {
-			fmt.Printf("    [Main Collector] Skipping non-product link: %s (from %s)\n", link, e.Request.URL.String())
-		}
-	})
-
-	productCollector.OnHTML("html", func(e *colly.HTMLElement) {
-		product := Product{}
-		product.URL = e.Request.URL.String()
-		product.Breadcrumb = strings.Join(e.ChildTexts(".breadcrumb li"), " > ")
-		product.ImageURL = e.ChildAttr(".product-image img", "src")
-		product.Category = e.ChildText(".category")
-		product.ProductName = e.ChildText(".product-title")
-		product.Price = e.ChildText(".product-price .value")
-		product.AvailableSizes = strings.Join(e.ChildTexts(".size-selector li"), ", ")
-		product.SizeDetails = strings.Join(e.ChildTexts(".size-details .size-info"), "; ")
-		product.Description = e.ChildText(".product-description")
-
-		keywordsMeta := e.DOM.Find("meta[name='keywords']")
-		if keywordsMeta.Length() > 0 {
-			content, exists := keywordsMeta.Attr("content")
-			if exists {
-				product.Keywords = content
-			} else {
-				product.Keywords = ""
-				fmt.Printf("        [Product Collector] Warning: 'content' attribute not found for keywords meta tag on %s\n", e.Request.URL.String())
-			}
-		} else {
-			product.Keywords = ""
-			fmt.Printf("        [Product Collector] Warning: Meta tag 'meta[name='keywords']' not found on %s\n", e.Request.URL.String())
-		}
-
-		products = append(products, product)
-		fmt.Printf("        [Product Collector] Scraped product: %s\n", product.ProductName)
-	})
-
-	fmt.Println("Starting scraping from: https://shop.adidas.jp/men/")
-	err := c.Visit("https://shop.adidas.jp/men/")
-	if err != nil {
-		log.Fatalf("Failed to visit initial URL: %v\n", err)
+	// ** FIXED: ProductID is reliably parsed from the URL. **
+	p.URL = url
+	urlParts := strings.Split(strings.Trim(url, "/"), "/")
+	if len(urlParts) > 0 {
+		p.ProductID = urlParts[len(urlParts)-1]
 	}
 
-	c.Wait()
-	productCollector.Wait()
+	sizeChartScript := `(() => { const table = document.querySelector('.p-size-chart__table table'); if (!table) return null; const headers = Array.from(table.querySelectorAll('thead th')).map(th => th.innerText.trim()); const rows = Array.from(table.querySelectorAll('tbody tr')).map(tr => { const rowData = {}; Array.from(tr.querySelectorAll('td')).forEach((td, i) => { const header = headers[i]; if (header) rowData[header] = td.innerText.trim(); }); return rowData; }); return JSON.stringify(rows); })();`
+	reviewsScript := `(() => { const reviews = []; document.querySelectorAll('.BVRRDisplayContentReview').forEach(el => { reviews.push({ rating: el.querySelector('.BVRRRatingNumber')?.innerText.trim(), title: el.querySelector('.BVRRValueTitle')?.innerText.trim(), date: el.querySelector('.BVRRValueDate')?.innerText.trim(), reviewer: el.querySelector('.BVRRValueNickname')?.innerText.trim(), description: el.querySelector('.BVRRReviewTextContainer')?.innerText.trim() }); }); return JSON.stringify(reviews); })();`
+	coordinatedProductsScript := `(() => { const items = []; document.querySelectorAll('.p-coordinated-items__list-item a').forEach(el => { items.push({ name: el.querySelector('.p-coordinated-items__name')?.innerText.trim(), price: el.querySelector('.c-price__value')?.innerText.trim(), url: el.href, imageUrl: el.querySelector('img')?.src }); }); return JSON.stringify(items); })();`
 
-	err = os.MkdirAll("csv", os.ModePerm)
+	scrapeCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	log.Printf("-> [%s] Running browser actions...", url)
+	err := chromedp.Run(scrapeCtx,
+		chromedp.Navigate(url),
+		chromedp.WaitReady(`h1.p-article__name`),
+
+		// ** FIXED: All selectors are based on the provided HTML files. **
+		chromedp.Text(`h1.p-article__name`, &p.Name),
+		chromedp.Text(`.p-article__breadcrumb`, &p.Breadcrumb),
+		chromedp.Text(`.p-price-group__price-item .c-price__value`, &p.Price),
+		chromedp.Text(`.c-description__title`, &p.DescriptionTitle),
+		chromedp.Text(`.c-description__text`, &p.DescriptionGeneral),
+		chromedp.Text(`[data-test-id="pdp-description-itemized"]`, &p.DescriptionItemized),
+		chromedp.Text(`[data-test-id="sense-of-size-info"]`, &p.SenseOfSize),
+		chromedp.Text(`[data-test-id="reviews-overall-rating"]`, &p.OverallRating),
+		chromedp.Text(`[data-test-id="reviews-number-of-reviews"]`, &p.NumberOfReviews),
+		chromedp.Text(`[data-test-id="reviews-recommended-rate"]`, &p.RecommendedRate),
+		chromedp.AttributeValue(`.c-article-image__img`, "src", &p.ImageURL, nil), // Get image URL
+
+		// ** FIXED: Extracting other data points directly. **
+		chromedp.Evaluate(`Array.from(document.querySelectorAll('.p-size-selector__item-button')).map(btn => btn.innerText.trim()).join(', ')`, &p.AvailableSizes),
+		chromedp.Evaluate(`Array.from(document.querySelectorAll('.p-tags__list-item-link')).map(a => a.innerText.trim()).join(', ')`, &p.Keywords),
+		chromedp.Evaluate(coordinatedProductsScript, &coordinatedRaw),
+		chromedp.Evaluate(reviewsScript, &reviewsRaw),
+
+		// ** FIXED: Clicking size chart link. **
+		chromedp.Click(`.p-size-chart__link`, chromedp.NodeVisible),
+		chromedp.WaitVisible(`.p-size-chart__table`),
+		chromedp.Evaluate(sizeChartScript, &sizeChartRaw),
+	)
+
 	if err != nil {
-		log.Fatalf("Could not create directory 'csv': %v", err)
+		return Product{}, fmt.Errorf("browser actions failed: %w", err)
 	}
 
-	file, err := os.Create("csv/products.csv")
+	p.SizeChartJSON = sizeChartRaw
+	p.ReviewsJSON = reviewsRaw
+	p.CoordinatedProductsJSON = coordinatedRaw
+
+	return p, nil
+}
+
+func writeCSV(products []Product) {
+	if err := os.MkdirAll("data", os.ModePerm); err != nil {
+		log.Fatalf("Failed to create data directory: %v", err)
+	}
+	file, err := os.Create("data/products.csv")
 	if err != nil {
-		log.Fatalf("Could not create CSV file: %v", err)
+		log.Fatalf("Failed to create CSV file: %v", err)
 	}
 	defer file.Close()
 
@@ -158,18 +227,27 @@ func Start() {
 	defer writer.Flush()
 
 	headers := []string{
-		"URL", "Breadcrumb", "ImageURL", "Category", "ProductName",
-		"Price", "AvailableSizes", "SizeDetails", "Description", "Keywords",
+		"URL", "ProductID", "Name", "Price", "ImageURL", "Breadcrumb",
+		"DescriptionGeneral", "DescriptionTitle", "DescriptionItemized",
+		"AvailableSizes", "SenseOfSize", "Keywords",
+		"SizeChartJSON", "ReviewsJSON", "OverallRating", "NumberOfReviews", "RecommendedRate",
+		"CoordinatedProductsJSON",
 	}
-	writer.Write(headers)
+	if err := writer.Write(headers); err != nil {
+		log.Fatalf("Failed to write CSV headers: %v", err)
+	}
 
 	for _, p := range products {
-		record := []string{
-			p.URL, p.Breadcrumb, p.ImageURL, p.Category, p.ProductName,
-			p.Price, p.AvailableSizes, p.SizeDetails, p.Description, p.Keywords,
+		row := []string{
+			p.URL, p.ProductID, p.Name, p.Price, p.ImageURL, p.Breadcrumb,
+			p.DescriptionGeneral, p.DescriptionTitle, p.DescriptionItemized,
+			p.AvailableSizes, p.SenseOfSize, p.Keywords,
+			p.SizeChartJSON, p.ReviewsJSON, p.OverallRating, p.NumberOfReviews, p.RecommendedRate,
+			p.CoordinatedProductsJSON,
 		}
-		writer.Write(record)
+		if err := writer.Write(row); err != nil {
+			log.Printf("Warning: failed to write row for %s: %v\n", p.Name, err)
+		}
 	}
-
-	fmt.Printf("Scraping completed. %d products written to csv/products.csv\n", len(products))
+	log.Printf("✅ Success! Data for %d products written to data/products.csv", len(products))
 }
